@@ -2,6 +2,7 @@ import discord
 import anthropic
 import os
 import requests
+from collections import defaultdict
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
@@ -13,10 +14,14 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+conversation_history = defaultdict(list)
+MAX_HISTORY = 20
+
 SYSTEM_PROMPT = """あなたは児童発達支援・放課後等デイサービスの事業運営を支援するAIエージェントです。
 開業目標は2026年です。
 主要タスク：指定申請、物件選定、スタッフ採用、備品調達、保護者向け広報
-必ず日本語で簡潔に回答してください。"""
+会話の文脈を保持し、前の会話を踏まえて回答してください。
+必ず日本語で回答してください。"""
 
 def record_to_notion(title, result):
     url = "https://api.notion.com/v1/pages"
@@ -36,13 +41,13 @@ def record_to_notion(title, result):
         }
     }
     try:
-        r = requests.post(url, headers=headers, json=data)
-        print(f"Notion API status: {r.status_code}")
+        r = requests.post(url, headers=headers, json=data, timeout=10)
+        print(f"[Notion] status={r.status_code}")
         if r.status_code != 200:
-            print(f"Notion error: {r.text}")
+            print(f"[Notion] error={r.text[:200]}")
         return r.status_code == 200
     except Exception as e:
-        print(f"Notion error: {e}")
+        print(f"[Notion] exception={e}")
         return False
 
 @client.event
@@ -54,19 +59,13 @@ async def on_message(message):
     if message.author == client.user:
         return
 
-    async with message.channel.typing():
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": message.content}]
-        )
-        reply = response.content[0].text
-        success = record_to_notion(message.content, reply)
+    user_id = str(message.author.id)
 
-        if success:
-            await message.reply(reply + "\n\n✅ Notionに記録しました")
-        else:
-            await message.reply(reply + "\n\n⚠️ Notion記録に失敗しました")
+    if message.content.strip() == "/clear":
+        conversation_history[user_id] = []
+        await message.reply("会話履歴をクリアしました。")
+        return
 
-client.run(DISCORD_TOKEN)
+    conversation_history[user_id].append({
+        "role": "user",
+        "content": message.content
