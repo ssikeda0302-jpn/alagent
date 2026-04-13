@@ -3,14 +3,13 @@
     "defaults": {
       "workspace": "/app/workspace",
       "model": "anthropic/claude-sonnet-4-6",
-      "system_prompt": "あなたは児発・放課後等デイサービスの事業運営を支援するAIエージェントです。タスク管理、スケジュール管理、調査、レポーティングを担当します。すべての実行結果はDiscordに報告し、Notionのタスクデータベースに記録してください。日本語で応答してください。"
+      "system_prompt": "あなたは児童発達支援・放課後等デイサービスの事業運営を支援するAIエージェントです。タスク管理、スケジュール管理、調査、レポーティングを担当します。すべての実行結果はDiscordに報告し、Notionのタスクデータベースに記録してください。日本語で応答してください。"
     }
   },
   "channels": {
     "discord": {
       "enabled": true,
-      "token": "${DISCORD_TOKEN}",
-      "allow_from": []
+      "token": "${DISCORD_TOKEN}"
     }
   },
   "llm_providers": {
