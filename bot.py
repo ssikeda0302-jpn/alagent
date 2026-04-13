@@ -1,54 +1,17 @@
 import discord
-import anthropic
 import os
 import requests
 from collections import defaultdict
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
+N8N_WEBHOOK_URL = os.environ["N8N_WEBHOOK_URL"]
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 conversation_history = defaultdict(list)
 MAX_HISTORY = 20
-
-SYSTEM_PROMPT = """あなたは児童発達支援・放課後等デイサービスの事業運営を支援するAIエージェントです。
-開業目標は2026年です。
-主要タスク：指定申請、物件選定、スタッフ採用、備品調達、保護者向け広報
-会話の文脈を保持し、前の会話を踏まえて回答してください。
-必ず日本語で回答してください。"""
-
-def record_to_notion(title, result):
-    url = "https://api.notion.com/v1/pages"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28"
-    }
-    data = {
-        "parent": {"database_id": NOTION_DATABASE_ID},
-        "properties": {
-            "名前": {"title": [{"text": {"content": title[:100]}}]},
-            "ステータス": {"status": {"name": "完了"}},
-            "担当Worker": {"select": {"name": "タスク管理"}},
-            "優先度": {"select": {"name": "中"}},
-            "実行結果": {"rich_text": [{"text": {"content": result[:500]}}]}
-        }
-    }
-    try:
-        r = requests.post(url, headers=headers, json=data, timeout=10)
-        print(f"[Notion] status={r.status_code}")
-        if r.status_code != 200:
-            print(f"[Notion] error={r.text[:200]}")
-        return r.status_code == 200
-    except Exception as e:
-        print(f"[Notion] exception={e}")
-        return False
 
 @client.event
 async def on_ready():
@@ -69,3 +32,40 @@ async def on_message(message):
     conversation_history[user_id].append({
         "role": "user",
         "content": message.content
+    })
+
+    if len(conversation_history[user_id]) > MAX_HISTORY:
+        conversation_history[user_id] = conversation_history[user_id][-MAX_HISTORY:]
+
+    async with message.channel.typing():
+        try:
+            payload = {
+                "content": message.content,
+                "user_id": user_id,
+                "username": str(message.author),
+                "channel_id": str(message.channel.id),
+                "history": conversation_history[user_id]
+            }
+            r = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=30)
+            print(f"[n8n] status={r.status_code}")
+
+            if r.status_code == 200:
+                data = r.json()
+                reply = data.get("text", "") or data.get("message", "") or str(data)
+                if reply:
+                    conversation_history[user_id].append({
+                        "role": "assistant",
+                        "content": reply
+                    })
+                    await message.reply(reply)
+                else:
+                    await message.reply("処理完了しました。")
+            else:
+                print(f"[n8n] error={r.text[:200]}")
+                await message.reply(f"エラーが発生しました（status={r.status_code}）")
+
+        except Exception as e:
+            print(f"[Error] {e}")
+            await message.reply(f"エラーが発生しました: {str(e)[:100]}")
+
+client.run(DISCORD_TOKEN)
