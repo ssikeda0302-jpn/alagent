@@ -1,10 +1,5 @@
-FROM python:3.11-slim
+FROM n8nio/n8n:latest
 
-WORKDIR /app
+EXPOSE 5678
 
-RUN pip install "discord.py" anthropic requests
-
-COPY bot.py /app/bot.py
-COPY workspace/ /app/workspace/
-
-CMD ["python", "bot.py"]
+CMD ["n8n", "start"]
