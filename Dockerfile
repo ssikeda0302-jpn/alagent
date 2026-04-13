@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN pip install nanobot
+RUN pip install nanobot requests
 
 COPY config.json /app/config.json
 
