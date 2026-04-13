@@ -10,4 +10,4 @@ RUN mkdir -p /app/workspace
 
 COPY workspace/ /app/workspace/
 
-CMD ["nanobot", "gateway", "--config", "/app/config.json"]
+CMD ["nanobot", "--server", "discord"]
