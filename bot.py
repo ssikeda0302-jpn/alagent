@@ -269,7 +269,10 @@ async def on_message(message):
             if r.status_code == 200:
                 data = r.json()
                 raw_reply = data.get("text", "") or data.get("message", "") or str(data)
+                print(f"[DEBUG] raw_reply type={type(raw_reply).__name__} len={len(raw_reply)}")
+                print(f"[DEBUG] raw_reply={raw_reply[:500]}")
                 reply, task_ops = parse_ai_response(raw_reply)
+                print(f"[DEBUG] parsed reply={reply[:200] if reply else 'None'}, task_ops={len(task_ops)}")
 
                 if task_ops:
                     op_results = execute_task_ops(user_id, task_ops)
