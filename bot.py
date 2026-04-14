@@ -211,12 +211,23 @@ def execute_task_ops(user_id, task_ops):
 # --- メッセージ処理 ---
 
 def parse_ai_response(text):
+    import re
+    # まずそのままJSON解析
     try:
         data = json.loads(text)
         if isinstance(data, dict) and "reply" in data:
             return data.get("reply", ""), data.get("task_ops", [])
     except (json.JSONDecodeError, TypeError):
         pass
+    # テキスト中からJSON部分を抽出して解析
+    match = re.search(r'\{[\s\S]*"reply"[\s\S]*\}', text)
+    if match:
+        try:
+            data = json.loads(match.group())
+            if isinstance(data, dict) and "reply" in data:
+                return data.get("reply", ""), data.get("task_ops", [])
+        except (json.JSONDecodeError, TypeError):
+            pass
     return text, []
 
 
