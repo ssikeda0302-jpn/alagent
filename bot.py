@@ -2109,35 +2109,56 @@ async def on_message(message):
 
     save_message(user_id, channel_id, "user", message.content)
 
-    # --- 添付ファイルがあればDriveにアップロード ---
+    # --- 添付ファイル処理（Driveアップロード + 中身読み取り） ---
     uploaded_docs_info = []
-    if message.attachments and GOOGLE_SERVICE_ACCOUNT_JSON:
+    if message.attachments:
         async with message.channel.typing():
             for att in message.attachments:
                 try:
                     file_bytes = await att.read()
-                    result = upload_to_drive(
-                        file_bytes,
-                        att.filename,
-                        mime_type=att.content_type or "application/octet-stream"
+                    mime = att.content_type or "application/octet-stream"
+                    doc_info = {"filename": att.filename, "mime_type": mime}
+
+                    # テキスト系ファイルの中身を読み取る
+                    text_extensions = (".txt", ".md", ".csv", ".json", ".log", ".yaml", ".yml", ".py", ".js", ".html", ".xml", ".tsv")
+                    is_text = (
+                        mime.startswith("text/") or
+                        mime in ("application/json", "application/xml") or
+                        att.filename.lower().endswith(text_extensions)
                     )
-                    if result:
-                        doc_id = create_document(
-                            user_id=user_id,
-                            title=att.filename,
-                            drive_file_id=result["file_id"],
-                            drive_web_link=result["web_link"],
-                            file_name=att.filename,
-                            mime_type=result["mime_type"],
-                            file_size=result["size"]
-                        )
-                        uploaded_docs_info.append({
-                            "doc_id": doc_id,
-                            "filename": att.filename,
-                            "link": result["web_link"]
-                        })
+                    if is_text:
+                        try:
+                            text_content = file_bytes.decode("utf-8")
+                        except UnicodeDecodeError:
+                            try:
+                                text_content = file_bytes.decode("shift_jis")
+                            except UnicodeDecodeError:
+                                text_content = None
+                        if text_content:
+                            # 長すぎる場合は8000文字まで
+                            doc_info["text_content"] = text_content[:8000]
+                            if len(text_content) > 8000:
+                                doc_info["text_truncated"] = True
+
+                    # Driveに保存（環境変数が設定されている場合のみ）
+                    if GOOGLE_SERVICE_ACCOUNT_JSON:
+                        result = upload_to_drive(file_bytes, att.filename, mime_type=mime)
+                        if result:
+                            doc_id = create_document(
+                                user_id=user_id,
+                                title=att.filename,
+                                drive_file_id=result["file_id"],
+                                drive_web_link=result["web_link"],
+                                file_name=att.filename,
+                                mime_type=result["mime_type"],
+                                file_size=result["size"]
+                            )
+                            doc_info["doc_id"] = doc_id
+                            doc_info["link"] = result["web_link"]
+
+                    uploaded_docs_info.append(doc_info)
                 except Exception as e:
-                    print(f"[Attachment Upload Error] {e}")
+                    print(f"[Attachment Error] {e}")
 
     history = get_history(user_id)
     current_tasks = get_tasks(user_id)
@@ -2195,10 +2216,11 @@ async def on_message(message):
                         if formatted:
                             reply = (reply + "\n\n" + formatted) if reply else formatted
 
-                # 添付ファイル登録結果をreplyに追記
-                if uploaded_docs_info:
+                # 添付ファイル登録結果をreplyに追記（Drive保存されたもののみ）
+                saved_docs = [d for d in uploaded_docs_info if d.get("doc_id")]
+                if saved_docs:
                     lines = ["\n\n**資料を登録しました:**"]
-                    for d in uploaded_docs_info:
+                    for d in saved_docs:
                         lines.append(f"- [Doc#{d['doc_id']}] {d['filename']} → [開く]({d['link']})")
                     reply = (reply or "") + "\n".join(lines)
 
