@@ -331,6 +331,7 @@ def init_db():
                     file_name TEXT,
                     mime_type TEXT,
                     file_size BIGINT,
+                    text_content TEXT,
                     uploaded_by_user_id TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -338,6 +339,13 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_category ON documents (category)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_tags ON documents USING GIN (tags)")
+            # text_contentカラムが既存テーブルにない場合に追加
+            cur.execute("""
+                DO $$ BEGIN
+                    ALTER TABLE documents ADD COLUMN text_content TEXT;
+                EXCEPTION WHEN duplicate_column THEN NULL;
+                END $$
+            """)
         conn.commit()
     seed_qualifications()
     seed_addition_items()
@@ -1260,7 +1268,8 @@ def execute_schedule_ops(user_id, schedule_ops):
     return results
 
 
-def get_documents(category=None, tags=None, search_text=None, limit=50):
+def get_documents(category=None, tags=None, search_text=None, limit=50,
+                  include_content_preview=True, preview_chars=800):
     conditions = []
     params = []
     if category:
@@ -1270,12 +1279,20 @@ def get_documents(category=None, tags=None, search_text=None, limit=50):
         conditions.append("tags && %s")
         params.append(tags)
     if search_text:
-        conditions.append("(title ILIKE %s OR description ILIKE %s OR file_name ILIKE %s)")
+        conditions.append(
+            "(title ILIKE %s OR description ILIKE %s OR file_name ILIKE %s OR text_content ILIKE %s)"
+        )
         wild = f"%{search_text}%"
-        params.extend([wild, wild, wild])
+        params.extend([wild, wild, wild, wild])
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    # 本文プレビュー列（指定文字数で切る）
+    content_expr = f"LEFT(text_content, {int(preview_chars)})" if include_content_preview else "NULL"
     query = f"""SELECT id, title, description, category, tags, drive_file_id,
-                       drive_web_link, file_name, mime_type, file_size, created_at
+                       drive_web_link, file_name, mime_type, file_size,
+                       {content_expr} AS text_preview,
+                       (text_content IS NOT NULL) AS has_text,
+                       LENGTH(text_content) AS text_length,
+                       created_at
                 FROM documents {where}
                 ORDER BY created_at DESC LIMIT %s"""
     params.append(limit)
@@ -1289,25 +1306,37 @@ def get_documents(category=None, tags=None, search_text=None, limit=50):
     return rows
 
 
-def create_document(user_id, title, drive_file_id, drive_web_link,
+def get_document_full_text(doc_id):
+    """指定したドキュメントの本文全文を取得"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT text_content FROM documents WHERE id = %s", (doc_id,))
+            row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
+def create_document(user_id, title, drive_file_id=None, drive_web_link=None,
                     description=None, category=None, tags=None,
-                    file_name=None, mime_type=None, file_size=None):
+                    file_name=None, mime_type=None, file_size=None,
+                    text_content=None):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO documents (title, description, category, tags,
                    drive_file_id, drive_web_link, file_name, mime_type, file_size,
-                   uploaded_by_user_id)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   text_content, uploaded_by_user_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT (drive_file_id) DO UPDATE SET
                      title = EXCLUDED.title,
-                     description = EXCLUDED.description,
-                     category = EXCLUDED.category,
-                     tags = EXCLUDED.tags,
+                     description = COALESCE(EXCLUDED.description, documents.description),
+                     category = COALESCE(EXCLUDED.category, documents.category),
+                     tags = COALESCE(EXCLUDED.tags, documents.tags),
+                     text_content = COALESCE(EXCLUDED.text_content, documents.text_content),
                      updated_at = CURRENT_TIMESTAMP
                    RETURNING id""",
                 (title, description, category, tags or [],
-                 drive_file_id, drive_web_link, file_name, mime_type, file_size, user_id)
+                 drive_file_id, drive_web_link, file_name, mime_type, file_size,
+                 text_content, user_id)
             )
             doc_id = cur.fetchone()[0]
         conn.commit()
@@ -1315,7 +1344,7 @@ def create_document(user_id, title, drive_file_id, drive_web_link,
 
 
 def update_document(doc_id, **kwargs):
-    allowed = {"title", "description", "category", "tags"}
+    allowed = {"title", "description", "category", "tags", "text_content"}
     updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
     if not updates:
         return False
@@ -2109,7 +2138,7 @@ async def on_message(message):
 
     save_message(user_id, channel_id, "user", message.content)
 
-    # --- 添付ファイル処理（Driveアップロード + 中身読み取り） ---
+    # --- 添付ファイル処理（Driveアップロード + 中身読み取り + 永続化） ---
     uploaded_docs_info = []
     if message.attachments:
         async with message.channel.typing():
@@ -2126,35 +2155,50 @@ async def on_message(message):
                         mime in ("application/json", "application/xml") or
                         att.filename.lower().endswith(text_extensions)
                     )
+                    full_text = None
                     if is_text:
                         try:
-                            text_content = file_bytes.decode("utf-8")
+                            full_text = file_bytes.decode("utf-8")
                         except UnicodeDecodeError:
                             try:
-                                text_content = file_bytes.decode("shift_jis")
+                                full_text = file_bytes.decode("shift_jis")
                             except UnicodeDecodeError:
-                                text_content = None
-                        if text_content:
-                            # 長すぎる場合は8000文字まで
-                            doc_info["text_content"] = text_content[:8000]
-                            if len(text_content) > 8000:
+                                full_text = None
+                        if full_text:
+                            # payloadには8000文字まで
+                            doc_info["text_content"] = full_text[:8000]
+                            if len(full_text) > 8000:
                                 doc_info["text_truncated"] = True
 
-                    # Driveに保存（環境変数が設定されている場合のみ）
+                    # Driveに保存 + DB登録（環境変数が設定されている場合のみDriveアップ、DBは常に登録）
+                    drive_file_id = None
+                    drive_web_link = None
+                    file_size = len(file_bytes)
                     if GOOGLE_SERVICE_ACCOUNT_JSON:
                         result = upload_to_drive(file_bytes, att.filename, mime_type=mime)
                         if result:
-                            doc_id = create_document(
-                                user_id=user_id,
-                                title=att.filename,
-                                drive_file_id=result["file_id"],
-                                drive_web_link=result["web_link"],
-                                file_name=att.filename,
-                                mime_type=result["mime_type"],
-                                file_size=result["size"]
-                            )
-                            doc_info["doc_id"] = doc_id
-                            doc_info["link"] = result["web_link"]
+                            drive_file_id = result["file_id"]
+                            drive_web_link = result["web_link"]
+                            file_size = result["size"]
+                            mime = result["mime_type"]
+
+                    # text_contentを含めてDBに永続化
+                    try:
+                        doc_id = create_document(
+                            user_id=user_id,
+                            title=att.filename,
+                            drive_file_id=drive_file_id,
+                            drive_web_link=drive_web_link,
+                            file_name=att.filename,
+                            mime_type=mime,
+                            file_size=file_size,
+                            text_content=full_text  # 全文保存
+                        )
+                        doc_info["doc_id"] = doc_id
+                        if drive_web_link:
+                            doc_info["link"] = drive_web_link
+                    except Exception as e:
+                        print(f"[DB Insert Error] {e}")
 
                     uploaded_docs_info.append(doc_info)
                 except Exception as e:
@@ -2216,12 +2260,13 @@ async def on_message(message):
                         if formatted:
                             reply = (reply + "\n\n" + formatted) if reply else formatted
 
-                # 添付ファイル登録結果をreplyに追記（Drive保存されたもののみ）
+                # 添付ファイル登録結果をreplyに追記
                 saved_docs = [d for d in uploaded_docs_info if d.get("doc_id")]
                 if saved_docs:
                     lines = ["\n\n**資料を登録しました:**"]
                     for d in saved_docs:
-                        lines.append(f"- [Doc#{d['doc_id']}] {d['filename']} → [開く]({d['link']})")
+                        link_part = f" → [開く]({d['link']})" if d.get("link") else ""
+                        lines.append(f"- [Doc#{d['doc_id']}] {d['filename']}{link_part}")
                     reply = (reply or "") + "\n".join(lines)
 
                 if reply:
