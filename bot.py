@@ -1,23 +1,136 @@
 import discord
+from discord import app_commands
 from discord.ext import tasks
+from discord.ui import View, Button
 import os
 import json
 import re
+import io
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import date, datetime, time, timedelta
-import asyncio
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 N8N_WEBHOOK_URL = os.environ["N8N_WEBHOOK_URL"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 REMINDER_CHANNEL_ID = os.environ.get("REMINDER_CHANNEL_ID", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 MAX_HISTORY = 20
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+
+# --- Google Drive セットアップ（オプション） ---
+_drive_service = None
+
+
+def get_drive_service():
+    global _drive_service
+    if _drive_service is not None:
+        return _drive_service
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        print("[Drive] サービス初期化完了")
+        return _drive_service
+    except Exception as e:
+        print(f"[Drive Init Error] {e}")
+        return None
+
+
+def upload_to_drive(file_bytes, filename, mime_type="application/octet-stream"):
+    """Driveにファイルをアップロード。戻り値: {file_id, web_link, size} or None"""
+    svc = get_drive_service()
+    if not svc or not GOOGLE_DRIVE_FOLDER_ID:
+        return None
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
+        metadata = {"name": filename, "parents": [GOOGLE_DRIVE_FOLDER_ID]}
+        result = svc.files().create(
+            body=metadata, media_body=media,
+            fields="id, webViewLink, size, mimeType, name"
+        ).execute()
+        return {
+            "file_id": result.get("id"),
+            "web_link": result.get("webViewLink"),
+            "size": int(result.get("size", 0)) if result.get("size") else 0,
+            "mime_type": result.get("mimeType"),
+            "name": result.get("name")
+        }
+    except Exception as e:
+        print(f"[Drive Upload Error] {e}")
+        return None
+
+
+def download_from_drive(file_id):
+    """Driveからファイルをダウンロード。戻り値: bytes or None"""
+    svc = get_drive_service()
+    if not svc:
+        return None
+    try:
+        from googleapiclient.http import MediaIoBaseDownload
+        request = svc.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        print(f"[Drive Download Error] {e}")
+        return None
+
+
+def list_drive_folder_files():
+    """共有フォルダ内の全ファイルを取得"""
+    svc = get_drive_service()
+    if not svc or not GOOGLE_DRIVE_FOLDER_ID:
+        return []
+    try:
+        query = f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+        results = []
+        page_token = None
+        while True:
+            resp = svc.files().list(
+                q=query,
+                fields="nextPageToken, files(id, name, mimeType, size, webViewLink)",
+                pageSize=100,
+                pageToken=page_token
+            ).execute()
+            results.extend(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return results
+    except Exception as e:
+        print(f"[Drive List Error] {e}")
+        return []
+
+
+def delete_from_drive(file_id):
+    svc = get_drive_service()
+    if not svc:
+        return False
+    try:
+        svc.files().delete(fileId=file_id).execute()
+        return True
+    except Exception as e:
+        print(f"[Drive Delete Error] {e}")
+        return False
 
 
 def get_db():
@@ -205,6 +318,26 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_candidates_status ON candidates (status)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_employees_active ON employees (is_active, position)")
+            # --- 資料管理テーブル ---
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS documents (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    category TEXT,
+                    tags TEXT[],
+                    drive_file_id TEXT UNIQUE,
+                    drive_web_link TEXT,
+                    file_name TEXT,
+                    mime_type TEXT,
+                    file_size BIGINT,
+                    uploaded_by_user_id TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_category ON documents (category)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_tags ON documents USING GIN (tags)")
         conn.commit()
     seed_qualifications()
     seed_addition_items()
@@ -1127,6 +1260,161 @@ def execute_schedule_ops(user_id, schedule_ops):
     return results
 
 
+def get_documents(category=None, tags=None, search_text=None, limit=50):
+    conditions = []
+    params = []
+    if category:
+        conditions.append("category = %s")
+        params.append(category)
+    if tags:
+        conditions.append("tags && %s")
+        params.append(tags)
+    if search_text:
+        conditions.append("(title ILIKE %s OR description ILIKE %s OR file_name ILIKE %s)")
+        wild = f"%{search_text}%"
+        params.extend([wild, wild, wild])
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    query = f"""SELECT id, title, description, category, tags, drive_file_id,
+                       drive_web_link, file_name, mime_type, file_size, created_at
+                FROM documents {where}
+                ORDER BY created_at DESC LIMIT %s"""
+    params.append(limit)
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+    for row in rows:
+        if row.get("created_at"):
+            row["created_at"] = str(row["created_at"])
+    return rows
+
+
+def create_document(user_id, title, drive_file_id, drive_web_link,
+                    description=None, category=None, tags=None,
+                    file_name=None, mime_type=None, file_size=None):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO documents (title, description, category, tags,
+                   drive_file_id, drive_web_link, file_name, mime_type, file_size,
+                   uploaded_by_user_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (drive_file_id) DO UPDATE SET
+                     title = EXCLUDED.title,
+                     description = EXCLUDED.description,
+                     category = EXCLUDED.category,
+                     tags = EXCLUDED.tags,
+                     updated_at = CURRENT_TIMESTAMP
+                   RETURNING id""",
+                (title, description, category, tags or [],
+                 drive_file_id, drive_web_link, file_name, mime_type, file_size, user_id)
+            )
+            doc_id = cur.fetchone()[0]
+        conn.commit()
+    return doc_id
+
+
+def update_document(doc_id, **kwargs):
+    allowed = {"title", "description", "category", "tags"}
+    updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+    if not updates:
+        return False
+    set_clause = ", ".join(f"{k} = %s" for k in updates)
+    values = list(updates.values()) + [doc_id]
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE documents SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                values
+            )
+            affected = cur.rowcount
+        conn.commit()
+    return affected > 0
+
+
+def delete_document(doc_id, delete_from_drive_too=True):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT drive_file_id FROM documents WHERE id = %s", (doc_id,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            drive_file_id = row[0]
+            cur.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
+        conn.commit()
+    if delete_from_drive_too and drive_file_id:
+        delete_from_drive(drive_file_id)
+    return True
+
+
+def scan_and_import_drive(user_id):
+    """Drive共有フォルダの既存ファイルをDBに取り込む"""
+    imported = 0
+    skipped = 0
+    for f in list_drive_folder_files():
+        file_id = f.get("id")
+        name = f.get("name", "unknown")
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM documents WHERE drive_file_id = %s", (file_id,))
+                if cur.fetchone():
+                    skipped += 1
+                    continue
+        try:
+            create_document(
+                user_id=user_id,
+                title=name,
+                drive_file_id=file_id,
+                drive_web_link=f.get("webViewLink"),
+                file_name=name,
+                mime_type=f.get("mimeType"),
+                file_size=int(f.get("size", 0)) if f.get("size") else 0
+            )
+            imported += 1
+        except Exception as e:
+            print(f"[Scan Error] {name}: {e}")
+    return {"imported": imported, "skipped": skipped}
+
+
+# --- 資料ops実行 ---
+
+def execute_doc_ops(user_id, doc_ops):
+    results = []
+    for op in doc_ops:
+        action = op.get("action")
+        try:
+            if action == "register":
+                doc_id = create_document(
+                    user_id=user_id,
+                    title=op.get("title", ""),
+                    drive_file_id=op.get("drive_file_id"),
+                    drive_web_link=op.get("drive_web_link"),
+                    description=op.get("description"),
+                    category=op.get("category"),
+                    tags=op.get("tags"),
+                    file_name=op.get("file_name"),
+                    mime_type=op.get("mime_type"),
+                    file_size=op.get("file_size")
+                )
+                results.append(f"[Doc#{doc_id}] 登録完了")
+            elif action == "update":
+                did = op.get("doc_id")
+                fields = {k: v for k, v in op.items() if k not in ("action", "doc_id")}
+                if update_document(did, **fields):
+                    results.append(f"[Doc#{did}] 更新完了")
+            elif action == "delete":
+                did = op.get("doc_id")
+                if delete_document(did):
+                    results.append(f"[Doc#{did}] 削除完了")
+            elif action == "scan":
+                r = scan_and_import_drive(user_id)
+                results.append(f"[Scan] 取り込み {r['imported']}件 / スキップ {r['skipped']}件")
+        except Exception as e:
+            print(f"[DocOp Error] {action}: {e}")
+            results.append(f"[DocOp Error] {action}: {str(e)[:80]}")
+    return results
+
+
 def execute_hr_ops(user_id, hr_ops):
     results = []
     for op in hr_ops:
@@ -1292,36 +1580,472 @@ def format_revenue_result(results):
 # --- メッセージ処理 ---
 
 def parse_ai_response(text):
-    # まずそのままJSON解析
+    def extract(data):
+        return (data.get("reply", ""),
+                data.get("task_ops", []),
+                data.get("schedule_ops", []),
+                data.get("hr_ops", []),
+                data.get("revenue_ops", []),
+                data.get("doc_ops", []))
     try:
         data = json.loads(text)
         if isinstance(data, dict) and "reply" in data:
-            return (data.get("reply", ""),
-                    data.get("task_ops", []),
-                    data.get("schedule_ops", []),
-                    data.get("hr_ops", []),
-                    data.get("revenue_ops", []))
+            return extract(data)
     except (json.JSONDecodeError, TypeError):
         pass
-    # テキスト中からJSON部分を抽出して解析
     match = re.search(r'\{[\s\S]*"reply"[\s\S]*\}', text)
     if match:
         try:
             data = json.loads(match.group())
             if isinstance(data, dict) and "reply" in data:
-                return (data.get("reply", ""),
-                        data.get("task_ops", []),
-                        data.get("schedule_ops", []),
-                        data.get("hr_ops", []),
-                        data.get("revenue_ops", []))
+                return extract(data)
         except (json.JSONDecodeError, TypeError):
             pass
-    return text, [], [], [], []
+    return text, [], [], [], [], []
+
+
+# ==========================================
+# Discord ダッシュボードUI
+# ==========================================
+
+PRIORITY_EMOJI = {"urgent": "🔴", "high": "🟠", "medium": "🟡", "low": "⚪"}
+
+
+def get_deadline_color_and_icon(due_date_str):
+    """期限日から色とアイコンを返す"""
+    if not due_date_str:
+        return discord.Color.greyple(), "📝"
+    try:
+        d = date.fromisoformat(str(due_date_str))
+    except (ValueError, TypeError):
+        return discord.Color.greyple(), "📝"
+    today = date.today()
+    diff = (d - today).days
+    if diff < 0:
+        return discord.Color.from_rgb(80, 0, 0), "🚨"
+    if diff == 0:
+        return discord.Color.red(), "🔥"
+    if diff <= 2:
+        return discord.Color.orange(), "⚠️"
+    if diff <= 7:
+        return discord.Color.gold(), "📌"
+    return discord.Color.green(), "✅"
+
+
+def build_tasks_embed(user_id, page=0, per_page=5):
+    tasks_list = get_tasks(user_id)
+    total = len(tasks_list)
+
+    if not tasks_list:
+        return discord.Embed(
+            title="📋 タスクダッシュボード",
+            description="未完了のタスクはありません。",
+            color=discord.Color.greyple()
+        )
+
+    start = page * per_page
+    end = start + per_page
+    visible = tasks_list[start:end]
+
+    # 先頭タスクの色でembed全体の色を決める
+    colors = [get_deadline_color_and_icon(t.get("due_date")) for t in visible]
+    embed_color = colors[0][0] if colors else discord.Color.blue()
+
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    embed = discord.Embed(
+        title=f"📋 タスクダッシュボード ({start+1}〜{min(end, total)}/{total}件)",
+        color=embed_color,
+        timestamp=datetime.now()
+    )
+
+    for t in visible:
+        _, icon = get_deadline_color_and_icon(t.get("due_date"))
+        pri = PRIORITY_EMOJI.get(t.get("priority", "medium"), "⚪")
+        team = "👥" if t.get("is_team_task") else "👤"
+        due = t.get("due_date") or "期限なし"
+        cat = t.get("category") or "その他"
+        embed.add_field(
+            name=f"{icon} [#{t['id']}] {pri} {t['title']}",
+            value=f"{team} 期限: **{due}** ・ カテゴリ: `{cat}`",
+            inline=False
+        )
+
+    embed.set_footer(text=f"ページ {page+1}/{total_pages}")
+    return embed
+
+
+def build_schedules_embed(user_id, page=0, per_page=5):
+    schedules_list = get_schedules(user_id)
+    total = len(schedules_list)
+
+    if not schedules_list:
+        return discord.Embed(
+            title="📅 スケジュールダッシュボード",
+            description="今後の予定はありません。",
+            color=discord.Color.greyple()
+        )
+
+    start = page * per_page
+    end = start + per_page
+    visible = schedules_list[start:end]
+    total_pages = max(1, (total + per_page - 1) // per_page)
+
+    embed = discord.Embed(
+        title=f"📅 スケジュールダッシュボード ({start+1}〜{min(end, total)}/{total}件)",
+        color=discord.Color.blue(),
+        timestamp=datetime.now()
+    )
+
+    for s in visible:
+        icon = "🎯" if s.get("schedule_type") == "milestone" else "📆"
+        time_str = ""
+        if s.get("start_time"):
+            st = s["start_time"]
+            time_str = f" {st}" if isinstance(st, str) else f" {st.strftime('%H:%M')}"
+        loc = f" @{s['location']}" if s.get("location") else ""
+        team = "👥" if s.get("is_team_event") else "👤"
+        cat = s.get("category") or "その他"
+        embed.add_field(
+            name=f"{icon} [#{s['id']}] {s['title']}",
+            value=f"{team} {s.get('start_date', '')}{time_str}{loc} ・ カテゴリ: `{cat}`",
+            inline=False
+        )
+
+    embed.set_footer(text=f"ページ {page+1}/{total_pages}")
+    return embed
+
+
+def build_docs_embed(page=0, per_page=5, category=None):
+    docs = get_documents(category=category)
+    total = len(docs)
+
+    if not docs:
+        return discord.Embed(
+            title="📁 資料ダッシュボード",
+            description="登録されている資料はありません。",
+            color=discord.Color.greyple()
+        )
+
+    start = page * per_page
+    end = start + per_page
+    visible = docs[start:end]
+    total_pages = max(1, (total + per_page - 1) // per_page)
+
+    title = f"📁 資料ダッシュボード ({start+1}〜{min(end, total)}/{total}件)"
+    if category:
+        title += f" - {category}"
+    embed = discord.Embed(
+        title=title,
+        color=discord.Color.purple(),
+        timestamp=datetime.now()
+    )
+
+    for d in visible:
+        cat = d.get("category") or "未分類"
+        tags_str = " ".join(f"`{t}`" for t in (d.get("tags") or []))
+        size_kb = round((d.get("file_size") or 0) / 1024, 1) if d.get("file_size") else 0
+        desc = d.get("description") or ""
+        link = d.get("drive_web_link") or ""
+        value_lines = [f"カテゴリ: `{cat}`"]
+        if tags_str:
+            value_lines.append(f"タグ: {tags_str}")
+        if desc:
+            value_lines.append(desc[:80])
+        if size_kb:
+            value_lines.append(f"サイズ: {size_kb} KB")
+        if link:
+            value_lines.append(f"[📎 開く]({link})")
+        embed.add_field(
+            name=f"📄 [#{d['id']}] {d['title']}",
+            value="\n".join(value_lines),
+            inline=False
+        )
+
+    embed.set_footer(text=f"ページ {page+1}/{total_pages}")
+    return embed
+
+
+def build_overview_embed(user_id):
+    tasks_list = get_tasks(user_id)
+    schedules_list = get_schedules(user_id)
+    employees_list = get_employees(active_only=True)
+    candidates_list = get_candidates()
+    docs = get_documents(limit=500)
+
+    today = date.today()
+    urgent = [t for t in tasks_list if t.get("priority") in ("urgent", "high")]
+    overdue = []
+    for t in tasks_list:
+        if t.get("due_date"):
+            try:
+                if date.fromisoformat(str(t["due_date"])) < today:
+                    overdue.append(t)
+            except (ValueError, TypeError):
+                pass
+
+    color = discord.Color.red() if overdue else discord.Color.blue()
+    embed = discord.Embed(
+        title="📊 Alagent ダッシュボード",
+        color=color,
+        timestamp=datetime.now()
+    )
+    embed.add_field(
+        name="📋 タスク",
+        value=f"全{len(tasks_list)}件 / 高優先: {len(urgent)} / 期限切れ: {len(overdue)}",
+        inline=True
+    )
+    embed.add_field(
+        name="📅 スケジュール",
+        value=f"今後 {len(schedules_list)}件",
+        inline=True
+    )
+    embed.add_field(
+        name="👥 人材",
+        value=f"従業員: {len(employees_list)}名 / 候補者: {len(candidates_list)}名",
+        inline=True
+    )
+    embed.add_field(
+        name="📁 資料",
+        value=f"{len(docs)}件",
+        inline=True
+    )
+    upcoming = schedules_list[:3]
+    if upcoming:
+        embed.add_field(
+            name="直近の予定",
+            value="\n".join(f"・ {s['title']} ({s.get('start_date','')})" for s in upcoming),
+            inline=False
+        )
+    embed.set_footer(text="/tasks /schedule /docs で詳細表示")
+    return embed
+
+
+def make_task_complete_cb(user_id, task_id, page, per_page):
+    async def cb(interaction):
+        update_task(task_id, status="done")
+        new_view = TaskDashboardView(user_id, page)
+        new_embed = build_tasks_embed(user_id, page, per_page)
+        await interaction.response.edit_message(embed=new_embed, view=new_view)
+    return cb
+
+
+def make_task_page_cb(user_id, new_page, per_page):
+    async def cb(interaction):
+        new_view = TaskDashboardView(user_id, new_page)
+        new_embed = build_tasks_embed(user_id, new_page, per_page)
+        await interaction.response.edit_message(embed=new_embed, view=new_view)
+    return cb
+
+
+class TaskDashboardView(View):
+    def __init__(self, user_id, page=0):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self.page = page
+        self.per_page = 5
+        self._build_items()
+
+    def _build_items(self):
+        self.clear_items()
+        tasks_list = get_tasks(self.user_id)
+        total = len(tasks_list)
+        start = self.page * self.per_page
+        end = start + self.per_page
+        visible = tasks_list[start:end]
+
+        for t in visible:
+            btn = Button(
+                label=f"✅ #{t['id']}",
+                style=discord.ButtonStyle.success,
+                row=0
+            )
+            btn.callback = make_task_complete_cb(self.user_id, t['id'], self.page, self.per_page)
+            self.add_item(btn)
+
+        if total > self.per_page:
+            prev_btn = Button(
+                label="◀ 前",
+                style=discord.ButtonStyle.secondary,
+                disabled=(self.page == 0),
+                row=1
+            )
+            prev_btn.callback = make_task_page_cb(self.user_id, max(0, self.page - 1), self.per_page)
+            self.add_item(prev_btn)
+
+            next_btn = Button(
+                label="次 ▶",
+                style=discord.ButtonStyle.secondary,
+                disabled=(end >= total),
+                row=1
+            )
+            next_btn.callback = make_task_page_cb(self.user_id, self.page + 1, self.per_page)
+            self.add_item(next_btn)
+
+        refresh_btn = Button(label="🔄 更新", style=discord.ButtonStyle.primary, row=1)
+        refresh_btn.callback = make_task_page_cb(self.user_id, self.page, self.per_page)
+        self.add_item(refresh_btn)
+
+
+def make_schedule_delete_cb(user_id, schedule_id, page, per_page):
+    async def cb(interaction):
+        delete_schedule(schedule_id)
+        new_view = ScheduleDashboardView(user_id, page)
+        new_embed = build_schedules_embed(user_id, page, per_page)
+        await interaction.response.edit_message(embed=new_embed, view=new_view)
+    return cb
+
+
+def make_schedule_page_cb(user_id, new_page, per_page):
+    async def cb(interaction):
+        new_view = ScheduleDashboardView(user_id, new_page)
+        new_embed = build_schedules_embed(user_id, new_page, per_page)
+        await interaction.response.edit_message(embed=new_embed, view=new_view)
+    return cb
+
+
+class ScheduleDashboardView(View):
+    def __init__(self, user_id, page=0):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self.page = page
+        self.per_page = 5
+        self._build_items()
+
+    def _build_items(self):
+        self.clear_items()
+        schedules_list = get_schedules(self.user_id)
+        total = len(schedules_list)
+        start = self.page * self.per_page
+        end = start + self.per_page
+        visible = schedules_list[start:end]
+
+        for s in visible:
+            btn = Button(label=f"🗑 #{s['id']}", style=discord.ButtonStyle.danger, row=0)
+            btn.callback = make_schedule_delete_cb(self.user_id, s['id'], self.page, self.per_page)
+            self.add_item(btn)
+
+        if total > self.per_page:
+            prev_btn = Button(label="◀ 前", style=discord.ButtonStyle.secondary,
+                              disabled=(self.page == 0), row=1)
+            prev_btn.callback = make_schedule_page_cb(self.user_id, max(0, self.page - 1), self.per_page)
+            self.add_item(prev_btn)
+
+            next_btn = Button(label="次 ▶", style=discord.ButtonStyle.secondary,
+                              disabled=(end >= total), row=1)
+            next_btn.callback = make_schedule_page_cb(self.user_id, self.page + 1, self.per_page)
+            self.add_item(next_btn)
+
+        refresh_btn = Button(label="🔄 更新", style=discord.ButtonStyle.primary, row=1)
+        refresh_btn.callback = make_schedule_page_cb(self.user_id, self.page, self.per_page)
+        self.add_item(refresh_btn)
+
+
+class DocsDashboardView(View):
+    def __init__(self, page=0, category=None):
+        super().__init__(timeout=600)
+        self.page = page
+        self.per_page = 5
+        self.category = category
+        self._build_items()
+
+    def _build_items(self):
+        self.clear_items()
+        docs = get_documents(category=self.category)
+        total = len(docs)
+
+        if total > self.per_page:
+            prev_btn = Button(label="◀ 前", style=discord.ButtonStyle.secondary,
+                              disabled=(self.page == 0), row=0)
+
+            async def prev_cb(interaction):
+                new_view = DocsDashboardView(self.page - 1, self.category)
+                new_embed = build_docs_embed(self.page - 1, self.per_page, self.category)
+                await interaction.response.edit_message(embed=new_embed, view=new_view)
+
+            prev_btn.callback = prev_cb
+            self.add_item(prev_btn)
+
+            next_btn = Button(label="次 ▶", style=discord.ButtonStyle.secondary,
+                              disabled=((self.page + 1) * self.per_page >= total), row=0)
+
+            async def next_cb(interaction):
+                new_view = DocsDashboardView(self.page + 1, self.category)
+                new_embed = build_docs_embed(self.page + 1, self.per_page, self.category)
+                await interaction.response.edit_message(embed=new_embed, view=new_view)
+
+            next_btn.callback = next_cb
+            self.add_item(next_btn)
+
+        refresh_btn = Button(label="🔄 更新", style=discord.ButtonStyle.primary, row=0)
+
+        async def refresh_cb(interaction):
+            new_view = DocsDashboardView(self.page, self.category)
+            new_embed = build_docs_embed(self.page, self.per_page, self.category)
+            await interaction.response.edit_message(embed=new_embed, view=new_view)
+
+        refresh_btn.callback = refresh_cb
+        self.add_item(refresh_btn)
+
+        scan_btn = Button(label="🔍 Driveスキャン", style=discord.ButtonStyle.secondary, row=0)
+
+        async def scan_cb(interaction):
+            await interaction.response.defer()
+            result = scan_and_import_drive(str(interaction.user.id))
+            new_view = DocsDashboardView(0, self.category)
+            new_embed = build_docs_embed(0, self.per_page, self.category)
+            await interaction.edit_original_response(
+                content=f"📥 スキャン完了: 取り込み {result['imported']}件 / スキップ {result['skipped']}件",
+                embed=new_embed,
+                view=new_view
+            )
+
+        scan_btn.callback = scan_cb
+        self.add_item(scan_btn)
+
+
+# --- スラッシュコマンド ---
+
+@tree.command(name="tasks", description="タスクダッシュボードを表示")
+async def tasks_command(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    embed = build_tasks_embed(user_id, page=0)
+    view = TaskDashboardView(user_id, page=0)
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+@tree.command(name="schedule", description="スケジュールダッシュボードを表示")
+async def schedule_command(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    embed = build_schedules_embed(user_id, page=0)
+    view = ScheduleDashboardView(user_id, page=0)
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+@tree.command(name="docs", description="資料ダッシュボードを表示")
+@app_commands.describe(category="カテゴリで絞り込み（任意）")
+async def docs_command(interaction: discord.Interaction, category: str = None):
+    embed = build_docs_embed(page=0, category=category)
+    view = DocsDashboardView(page=0, category=category)
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+@tree.command(name="dashboard", description="全体ダッシュボードを表示")
+async def dashboard_command(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    embed = build_overview_embed(user_id)
+    await interaction.response.send_message(embed=embed)
 
 
 @client.event
 async def on_ready():
     print(f"Alagent起動完了: {client.user}")
+    try:
+        synced = await tree.sync()
+        print(f"[Slash] {len(synced)}個のコマンドを同期")
+    except Exception as e:
+        print(f"[Slash Sync Error] {e}")
+    if GOOGLE_SERVICE_ACCOUNT_JSON:
+        get_drive_service()  # 初期化を試みる
     if REMINDER_CHANNEL_ID:
         reminder_loop.start()
         print(f"[Reminder] 自動通知ループ開始 (channel={REMINDER_CHANNEL_ID})")
@@ -1384,12 +2108,44 @@ async def on_message(message):
         return
 
     save_message(user_id, channel_id, "user", message.content)
+
+    # --- 添付ファイルがあればDriveにアップロード ---
+    uploaded_docs_info = []
+    if message.attachments and GOOGLE_SERVICE_ACCOUNT_JSON:
+        async with message.channel.typing():
+            for att in message.attachments:
+                try:
+                    file_bytes = await att.read()
+                    result = upload_to_drive(
+                        file_bytes,
+                        att.filename,
+                        mime_type=att.content_type or "application/octet-stream"
+                    )
+                    if result:
+                        doc_id = create_document(
+                            user_id=user_id,
+                            title=att.filename,
+                            drive_file_id=result["file_id"],
+                            drive_web_link=result["web_link"],
+                            file_name=att.filename,
+                            mime_type=result["mime_type"],
+                            file_size=result["size"]
+                        )
+                        uploaded_docs_info.append({
+                            "doc_id": doc_id,
+                            "filename": att.filename,
+                            "link": result["web_link"]
+                        })
+                except Exception as e:
+                    print(f"[Attachment Upload Error] {e}")
+
     history = get_history(user_id)
     current_tasks = get_tasks(user_id)
     current_schedules = get_schedules(user_id)
     current_candidates = get_candidates()
     current_employees = get_employees(active_only=True)
     qualifications_master = get_qualifications()
+    current_documents = get_documents(limit=30)
 
     async with message.channel.typing():
         try:
@@ -1403,7 +2159,9 @@ async def on_message(message):
                 "schedules": current_schedules,
                 "candidates": current_candidates,
                 "employees": current_employees,
-                "qualifications_master": qualifications_master
+                "qualifications_master": qualifications_master,
+                "documents": current_documents,
+                "uploaded_docs": uploaded_docs_info
             }
             r = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=30)
             print(f"[n8n] status={r.status_code}")
@@ -1411,7 +2169,7 @@ async def on_message(message):
             if r.status_code == 200:
                 data = r.json()
                 raw_reply = data.get("text", "") or data.get("message", "") or str(data)
-                reply, task_ops, schedule_ops, hr_ops, revenue_ops = parse_ai_response(raw_reply)
+                reply, task_ops, schedule_ops, hr_ops, revenue_ops, doc_ops = parse_ai_response(raw_reply)
 
                 if task_ops:
                     op_results = execute_task_ops(user_id, task_ops)
@@ -1425,14 +2183,24 @@ async def on_message(message):
                     op_results = execute_hr_ops(user_id, hr_ops)
                     print(f"[HROps] {op_results}")
 
+                if doc_ops:
+                    op_results = execute_doc_ops(user_id, doc_ops)
+                    print(f"[DocOps] {op_results}")
+
                 if revenue_ops:
                     rev_results = execute_revenue_ops(user_id, revenue_ops)
                     print(f"[RevenueOps] {len(rev_results)} results")
-                    # 報酬算定結果をreplyに追記
                     if rev_results:
                         formatted = format_revenue_result(rev_results)
                         if formatted:
                             reply = (reply + "\n\n" + formatted) if reply else formatted
+
+                # 添付ファイル登録結果をreplyに追記
+                if uploaded_docs_info:
+                    lines = ["\n\n**資料を登録しました:**"]
+                    for d in uploaded_docs_info:
+                        lines.append(f"- [Doc#{d['doc_id']}] {d['filename']} → [開く]({d['link']})")
+                    reply = (reply or "") + "\n".join(lines)
 
                 if reply:
                     save_message(user_id, channel_id, "assistant", reply)
