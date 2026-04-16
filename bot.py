@@ -2202,18 +2202,43 @@ async def on_message(message):
                 try:
                     file_bytes = await att.read()
                     mime = att.content_type or "application/octet-stream"
-                    # Discordが日本語ファイル名をASCII化してしまうので対策
                     raw_filename = att.filename
+                    # 優先順: URL末尾から復元 > att.filename
+                    url_filename = None
                     try:
-                        filename = unquote(raw_filename)
+                        att_url = getattr(att, "url", None) or ""
+                        if att_url:
+                            path = att_url.split("?")[0]
+                            last = path.rsplit("/", 1)[-1]
+                            url_filename = unquote(last) if last else None
                     except Exception:
-                        filename = raw_filename
-                    # ファイル名が崩れている場合、メッセージ本文から推測
+                        url_filename = None
+
+                    candidates = []
+                    for cand in (url_filename, raw_filename):
+                        if not cand:
+                            continue
+                        try:
+                            candidates.append(unquote(cand))
+                        except Exception:
+                            candidates.append(cand)
+
+                    # 日本語を含むものを優先
+                    filename = None
+                    for cand in candidates:
+                        if not is_mangled_filename(cand):
+                            filename = cand
+                            break
+                    if not filename:
+                        filename = candidates[0] if candidates else raw_filename
+
+                    # それでも崩れているならメッセージ本文から推測
                     if is_mangled_filename(filename) and message.content.strip():
                         inferred = infer_filename_from_message(message.content, filename)
                         print(f"[Attachment] mangled -> inferred: {filename!r} -> {inferred!r}")
                         filename = inferred
-                    print(f"[Attachment] raw={raw_filename!r} final={filename!r}")
+
+                    print(f"[Attachment] raw={raw_filename!r} url_name={url_filename!r} final={filename!r}")
                     doc_info = {"filename": filename, "mime_type": mime}
 
                     # テキスト系ファイルの中身を読み取る
