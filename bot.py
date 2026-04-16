@@ -51,7 +51,7 @@ def get_drive_service():
 
 
 def upload_to_drive(file_bytes, filename, mime_type="application/octet-stream"):
-    """Driveにファイルをアップロード。戻り値: {file_id, web_link, size} or None"""
+    """Driveにファイルをアップロード（共有ドライブ対応）。戻り値: {file_id, web_link, size} or None"""
     svc = get_drive_service()
     if not svc or not GOOGLE_DRIVE_FOLDER_ID:
         return None
@@ -61,7 +61,8 @@ def upload_to_drive(file_bytes, filename, mime_type="application/octet-stream"):
         metadata = {"name": filename, "parents": [GOOGLE_DRIVE_FOLDER_ID]}
         result = svc.files().create(
             body=metadata, media_body=media,
-            fields="id, webViewLink, size, mimeType, name"
+            fields="id, webViewLink, size, mimeType, name",
+            supportsAllDrives=True
         ).execute()
         return {
             "file_id": result.get("id"),
@@ -82,7 +83,7 @@ def download_from_drive(file_id):
         return None
     try:
         from googleapiclient.http import MediaIoBaseDownload
-        request = svc.files().get_media(fileId=file_id)
+        request = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
         buf = io.BytesIO()
         downloader = MediaIoBaseDownload(buf, request)
         done = False
@@ -96,7 +97,7 @@ def download_from_drive(file_id):
 
 
 def list_drive_folder_files():
-    """共有フォルダ内の全ファイルを取得"""
+    """共有ドライブ/フォルダ内の全ファイルを取得（共有ドライブ対応）"""
     svc = get_drive_service()
     if not svc or not GOOGLE_DRIVE_FOLDER_ID:
         return []
@@ -109,7 +110,10 @@ def list_drive_folder_files():
                 q=query,
                 fields="nextPageToken, files(id, name, mimeType, size, webViewLink)",
                 pageSize=100,
-                pageToken=page_token
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+                corpora="allDrives"
             ).execute()
             results.extend(resp.get("files", []))
             page_token = resp.get("nextPageToken")
@@ -126,7 +130,7 @@ def delete_from_drive(file_id):
     if not svc:
         return False
     try:
-        svc.files().delete(fileId=file_id).execute()
+        svc.files().delete(fileId=file_id, supportsAllDrives=True).execute()
         return True
     except Exception as e:
         print(f"[Drive Delete Error] {e}")
