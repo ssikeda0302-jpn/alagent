@@ -10,6 +10,7 @@ import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import date, datetime, time, timedelta
+from urllib.parse import unquote
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 N8N_WEBHOOK_URL = os.environ["N8N_WEBHOOK_URL"]
@@ -2150,14 +2151,21 @@ async def on_message(message):
                 try:
                     file_bytes = await att.read()
                     mime = att.content_type or "application/octet-stream"
-                    doc_info = {"filename": att.filename, "mime_type": mime}
+                    # Discordが日本語ファイル名をURLエンコードすることがあるので復号
+                    raw_filename = att.filename
+                    try:
+                        filename = unquote(raw_filename)
+                    except Exception:
+                        filename = raw_filename
+                    print(f"[Attachment] raw={raw_filename!r} decoded={filename!r}")
+                    doc_info = {"filename": filename, "mime_type": mime}
 
                     # テキスト系ファイルの中身を読み取る
                     text_extensions = (".txt", ".md", ".csv", ".json", ".log", ".yaml", ".yml", ".py", ".js", ".html", ".xml", ".tsv")
                     is_text = (
                         mime.startswith("text/") or
                         mime in ("application/json", "application/xml") or
-                        att.filename.lower().endswith(text_extensions)
+                        filename.lower().endswith(text_extensions)
                     )
                     full_text = None
                     if is_text:
@@ -2179,7 +2187,7 @@ async def on_message(message):
                     drive_web_link = None
                     file_size = len(file_bytes)
                     if GOOGLE_SERVICE_ACCOUNT_JSON:
-                        result = upload_to_drive(file_bytes, att.filename, mime_type=mime)
+                        result = upload_to_drive(file_bytes, filename, mime_type=mime)
                         if result:
                             drive_file_id = result["file_id"]
                             drive_web_link = result["web_link"]
@@ -2190,10 +2198,10 @@ async def on_message(message):
                     try:
                         doc_id = create_document(
                             user_id=user_id,
-                            title=att.filename,
+                            title=filename,
                             drive_file_id=drive_file_id,
                             drive_web_link=drive_web_link,
-                            file_name=att.filename,
+                            file_name=filename,
                             mime_type=mime,
                             file_size=file_size,
                             text_content=full_text  # 全文保存
