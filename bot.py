@@ -138,6 +138,57 @@ def delete_from_drive(file_id):
         return False
 
 
+def rename_drive_file(file_id, new_name):
+    """Drive上のファイルをリネーム"""
+    svc = get_drive_service()
+    if not svc or not file_id:
+        return False
+    try:
+        svc.files().update(
+            fileId=file_id,
+            body={"name": new_name},
+            supportsAllDrives=True,
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"[Drive Rename Error] {e}")
+        return False
+
+
+def is_mangled_filename(filename):
+    """Discord等が日本語を削除してしまった名前かを判定"""
+    import os as _os
+    base = _os.path.splitext(filename)[0]
+    # 日本語（ひらがな・カタカナ・漢字）があるならOK
+    for ch in base:
+        code = ord(ch)
+        if 0x3040 <= code <= 0x30FF or 0x4E00 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF:
+            return False
+    # ASCIIのみ＋短い（5文字以下）、もしくは先頭がアンダースコア
+    if len(base) <= 5 or base.startswith("_"):
+        return True
+    return False
+
+
+def infer_filename_from_message(message_text, original_filename):
+    """メッセージ本文から意味のあるファイル名を推測"""
+    import os as _os
+    if not message_text:
+        return original_filename
+    first_line = message_text.strip().split("\n")[0]
+    # ファイル名に使えない文字を除去
+    clean = re.sub(r'[<>:"/\\|?*\r\n]', "", first_line).strip()
+    # 末尾の句読点を除く
+    clean = clean.rstrip("。、！？ .,!?")
+    if not clean:
+        return original_filename
+    ext = _os.path.splitext(original_filename)[1] or ""
+    new_name = clean[:80]
+    if ext and not new_name.endswith(ext):
+        new_name += ext
+    return new_name
+
+
 def get_db():
     return psycopg2.connect(DATABASE_URL)
 
@@ -2151,13 +2202,18 @@ async def on_message(message):
                 try:
                     file_bytes = await att.read()
                     mime = att.content_type or "application/octet-stream"
-                    # Discordが日本語ファイル名をURLエンコードすることがあるので復号
+                    # Discordが日本語ファイル名をASCII化してしまうので対策
                     raw_filename = att.filename
                     try:
                         filename = unquote(raw_filename)
                     except Exception:
                         filename = raw_filename
-                    print(f"[Attachment] raw={raw_filename!r} decoded={filename!r}")
+                    # ファイル名が崩れている場合、メッセージ本文から推測
+                    if is_mangled_filename(filename) and message.content.strip():
+                        inferred = infer_filename_from_message(message.content, filename)
+                        print(f"[Attachment] mangled -> inferred: {filename!r} -> {inferred!r}")
+                        filename = inferred
+                    print(f"[Attachment] raw={raw_filename!r} final={filename!r}")
                     doc_info = {"filename": filename, "mime_type": mime}
 
                     # テキスト系ファイルの中身を読み取る
