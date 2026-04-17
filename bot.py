@@ -1351,34 +1351,75 @@ def simulate_hire_impact(new_employee_spec, service_type="both",
 # --- リマインダー ---
 
 def get_upcoming_reminders():
-    tomorrow = (datetime.now() + timedelta(days=1)).date()
     today = datetime.now().date()
-    results = {"tasks": [], "schedules": []}
+    tomorrow = today + timedelta(days=1)
+    week_end = today + timedelta(days=(6 - today.weekday()))
+    results = {
+        "overdue_tasks": [],
+        "today_tasks": [],
+        "tomorrow_tasks": [],
+        "week_tasks": [],
+        "today_schedules": [],
+        "tomorrow_schedules": [],
+        "week_schedules": [],
+    }
     with get_db() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # 明日期限のタスク
+            # 期限切れタスク
             cur.execute(
-                """SELECT id, title, priority, due_date, assignee_user_id, created_by_user_id
-                   FROM tasks WHERE due_date = %s AND status != 'done'""",
-                (tomorrow,)
-            )
-            results["tasks"] = cur.fetchall()
-            # 今日期限で未完了のタスク（当日警告）
-            cur.execute(
-                """SELECT id, title, priority, due_date, assignee_user_id, created_by_user_id
-                   FROM tasks WHERE due_date = %s AND status != 'done'""",
+                """SELECT id, title, priority, due_date FROM tasks
+                   WHERE due_date < %s AND status != 'done'
+                   ORDER BY due_date ASC""",
                 (today,)
             )
-            results["tasks"].extend(cur.fetchall())
+            results["overdue_tasks"] = cur.fetchall()
+            # 今日期限のタスク
+            cur.execute(
+                """SELECT id, title, priority, due_date FROM tasks
+                   WHERE due_date = %s AND status != 'done'""",
+                (today,)
+            )
+            results["today_tasks"] = cur.fetchall()
+            # 明日期限のタスク
+            cur.execute(
+                """SELECT id, title, priority, due_date FROM tasks
+                   WHERE due_date = %s AND status != 'done'""",
+                (tomorrow,)
+            )
+            results["tomorrow_tasks"] = cur.fetchall()
+            # 今週残り（明後日〜週末）
+            if week_end > tomorrow:
+                cur.execute(
+                    """SELECT id, title, priority, due_date FROM tasks
+                       WHERE due_date > %s AND due_date <= %s AND status != 'done'
+                       ORDER BY due_date ASC""",
+                    (tomorrow, week_end)
+                )
+                results["week_tasks"] = cur.fetchall()
+            # 今日の予定
+            cur.execute(
+                """SELECT id, title, schedule_type, start_date, start_time, location
+                   FROM schedules WHERE start_date = %s""",
+                (today,)
+            )
+            results["today_schedules"] = cur.fetchall()
             # 明日の予定
             cur.execute(
-                """SELECT id, title, schedule_type, start_date, start_time, location,
-                          created_by_user_id
+                """SELECT id, title, schedule_type, start_date, start_time, location
                    FROM schedules WHERE start_date = %s AND reminder_sent = FALSE""",
                 (tomorrow,)
             )
-            results["schedules"] = cur.fetchall()
-            # リマインダー送信済みに更新
+            results["tomorrow_schedules"] = cur.fetchall()
+            # 今週残りの予定
+            if week_end > tomorrow:
+                cur.execute(
+                    """SELECT id, title, schedule_type, start_date, start_time, location
+                       FROM schedules WHERE start_date > %s AND start_date <= %s
+                       ORDER BY start_date ASC""",
+                    (tomorrow, week_end)
+                )
+                results["week_schedules"] = cur.fetchall()
+            # リマインダー送信済みフラグ
             cur.execute(
                 "UPDATE schedules SET reminder_sent = TRUE WHERE start_date = %s",
                 (tomorrow,)
@@ -1958,6 +1999,58 @@ def get_deadline_color_and_icon(due_date_str):
     return discord.Color.green(), "✅"
 
 
+def categorize_tasks_by_period(tasks_list):
+    """タスクを期間別に分類: 期限切れ/今日/今週/今月/来月/それ以降/期限なし"""
+    today = date.today()
+    # 今週の終わり（日曜日）
+    week_end = today + timedelta(days=(6 - today.weekday()))
+    # 今月の終わり
+    if today.month == 12:
+        month_end = date(today.year + 1, 1, 1) - timedelta(days=1)
+        next_month_end = date(today.year + 1, 2, 1) - timedelta(days=1)
+    elif today.month == 11:
+        month_end = date(today.year, 12, 31)
+        next_month_end = date(today.year + 1, 1, 31)
+    else:
+        month_end = date(today.year, today.month + 1, 1) - timedelta(days=1)
+        next_month_end = date(today.year, today.month + 2, 1) - timedelta(days=1)
+
+    buckets = {
+        "overdue": [],    # 期限切れ
+        "today": [],      # 今日
+        "this_week": [],  # 今週（今日除く）
+        "this_month": [], # 今月（今週除く）
+        "next_month": [], # 来月
+        "later": [],      # それ以降
+        "no_date": [],    # 期限なし
+    }
+
+    for t in tasks_list:
+        due_str = t.get("due_date")
+        if not due_str:
+            buckets["no_date"].append(t)
+            continue
+        try:
+            d = date.fromisoformat(str(due_str))
+        except (ValueError, TypeError):
+            buckets["no_date"].append(t)
+            continue
+        if d < today:
+            buckets["overdue"].append(t)
+        elif d == today:
+            buckets["today"].append(t)
+        elif d <= week_end:
+            buckets["this_week"].append(t)
+        elif d <= month_end:
+            buckets["this_month"].append(t)
+        elif d <= next_month_end:
+            buckets["next_month"].append(t)
+        else:
+            buckets["later"].append(t)
+
+    return buckets
+
+
 def build_tasks_embed(user_id, page=0, per_page=5):
     tasks_list = get_tasks(user_id)
     total = len(tasks_list)
@@ -1969,17 +2062,51 @@ def build_tasks_embed(user_id, page=0, per_page=5):
             color=discord.Color.greyple()
         )
 
+    buckets = categorize_tasks_by_period(tasks_list)
+
+    # ページングは全タスクのフラットリスト（期間別ソート済み）
+    ordered = (
+        buckets["overdue"] + buckets["today"] + buckets["this_week"]
+        + buckets["this_month"] + buckets["next_month"]
+        + buckets["later"] + buckets["no_date"]
+    )
+
     start = page * per_page
     end = start + per_page
-    visible = tasks_list[start:end]
+    visible = ordered[start:end]
 
-    # 先頭タスクの色でembed全体の色を決める
-    colors = [get_deadline_color_and_icon(t.get("due_date")) for t in visible]
-    embed_color = colors[0][0] if colors else discord.Color.blue()
+    # 最も緊急なバケットの色でembed全体の色を決める
+    if buckets["overdue"]:
+        embed_color = discord.Color.from_rgb(80, 0, 0)
+    elif buckets["today"]:
+        embed_color = discord.Color.red()
+    elif buckets["this_week"]:
+        embed_color = discord.Color.orange()
+    else:
+        embed_color = discord.Color.blue()
 
     total_pages = max(1, (total + per_page - 1) // per_page)
+
+    # ヘッダーサマリ
+    summary_parts = []
+    if buckets["overdue"]:
+        summary_parts.append(f"🚨期限切れ:{len(buckets['overdue'])}")
+    if buckets["today"]:
+        summary_parts.append(f"🔥今日:{len(buckets['today'])}")
+    if buckets["this_week"]:
+        summary_parts.append(f"⚠️今週:{len(buckets['this_week'])}")
+    if buckets["this_month"]:
+        summary_parts.append(f"📌今月:{len(buckets['this_month'])}")
+    if buckets["next_month"]:
+        summary_parts.append(f"📅来月:{len(buckets['next_month'])}")
+    if buckets["later"]:
+        summary_parts.append(f"✅以降:{len(buckets['later'])}")
+    if buckets["no_date"]:
+        summary_parts.append(f"📝期限なし:{len(buckets['no_date'])}")
+
     embed = discord.Embed(
         title=f"📋 タスクダッシュボード ({start+1}〜{min(end, total)}/{total}件)",
+        description=" ・ ".join(summary_parts) if summary_parts else "",
         color=embed_color,
         timestamp=datetime.now()
     )
@@ -2408,15 +2535,36 @@ async def on_ready():
         print(f"[Reminder] 自動通知ループ開始 (channel={REMINDER_CHANNEL_ID})")
 
 
+def _fmt_task_line(t):
+    due = t.get("due_date", "")
+    if isinstance(due, date):
+        due = due.isoformat()
+    pri = PRIORITY_EMOJI.get(t.get("priority", "medium"), "⚪")
+    return f"  {pri} {t['title']}（期限: {due}）"
+
+
+def _fmt_schedule_line(s):
+    time_str = ""
+    if s.get("start_time"):
+        st = s["start_time"]
+        time_str = f" {st.strftime('%H:%M') if hasattr(st, 'strftime') else st}"
+    loc = f" @{s['location']}" if s.get("location") else ""
+    return f"  📆 {s['title']}{time_str}{loc}"
+
+
 @tasks.loop(hours=1)
 async def reminder_loop():
     now = datetime.now()
-    # 毎日8時台に実行（JST想定、Railwayのタイムゾーン設定に依存）
     if now.hour != 8:
         return
     try:
-        reminders = get_upcoming_reminders()
-        if not reminders["tasks"] and not reminders["schedules"]:
+        r = get_upcoming_reminders()
+        has_content = any([
+            r["overdue_tasks"], r["today_tasks"], r["tomorrow_tasks"],
+            r["week_tasks"], r["today_schedules"], r["tomorrow_schedules"],
+            r["week_schedules"]
+        ])
+        if not has_content:
             return
 
         channel = client.get_channel(int(REMINDER_CHANNEL_ID))
@@ -2424,29 +2572,45 @@ async def reminder_loop():
             print(f"[Reminder] チャンネル {REMINDER_CHANNEL_ID} が見つかりません")
             return
 
-        lines = ["**リマインダー通知**\n"]
+        lines = ["**📋 おはようございます！本日のブリーフィングです。**\n"]
 
-        if reminders["tasks"]:
-            lines.append("**タスク（期限間近）:**")
-            for t in reminders["tasks"]:
-                due = t.get("due_date", "")
-                if isinstance(due, date):
-                    due = due.isoformat()
-                lines.append(f"- {t['title']}（期限: {due}、優先度: {t['priority']}）")
+        if r["overdue_tasks"]:
+            lines.append(f"🚨 **期限切れ（{len(r['overdue_tasks'])}件）**")
+            for t in r["overdue_tasks"]:
+                lines.append(_fmt_task_line(t))
             lines.append("")
 
-        if reminders["schedules"]:
-            lines.append("**明日の予定:**")
-            for s in reminders["schedules"]:
-                time_str = ""
-                if s.get("start_time"):
-                    st = s["start_time"]
-                    time_str = f" {st.strftime('%H:%M') if hasattr(st, 'strftime') else st}"
-                loc = f" @{s['location']}" if s.get("location") else ""
-                lines.append(f"- {s['title']}{time_str}{loc}")
+        if r["today_tasks"]:
+            lines.append(f"🔥 **今日が期限（{len(r['today_tasks'])}件）**")
+            for t in r["today_tasks"]:
+                lines.append(_fmt_task_line(t))
+            lines.append("")
 
-        await channel.send("\n".join(lines))
-        print(f"[Reminder] 通知送信完了: tasks={len(reminders['tasks'])}, schedules={len(reminders['schedules'])}")
+        if r["today_schedules"]:
+            lines.append(f"📅 **今日の予定（{len(r['today_schedules'])}件）**")
+            for s in r["today_schedules"]:
+                lines.append(_fmt_schedule_line(s))
+            lines.append("")
+
+        if r["tomorrow_tasks"] or r["tomorrow_schedules"]:
+            lines.append("**--- 明日 ---**")
+            for t in r["tomorrow_tasks"]:
+                lines.append(_fmt_task_line(t))
+            for s in r["tomorrow_schedules"]:
+                lines.append(_fmt_schedule_line(s))
+            lines.append("")
+
+        if r["week_tasks"] or r["week_schedules"]:
+            lines.append("**--- 今週残り ---**")
+            for t in r["week_tasks"]:
+                lines.append(_fmt_task_line(t))
+            for s in r["week_schedules"]:
+                lines.append(_fmt_schedule_line(s))
+            lines.append("")
+
+        await channel.send("\n".join(lines)[:2000])
+        total_items = sum(len(r[k]) for k in r)
+        print(f"[Reminder] 通知送信完了: {total_items}件")
     except Exception as e:
         print(f"[Reminder Error] {e}")
 
