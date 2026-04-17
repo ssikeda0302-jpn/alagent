@@ -2738,8 +2738,18 @@ async def on_message(message):
     current_schedules = get_schedules(user_id)
     current_candidates = get_candidates()
     current_employees = get_employees(active_only=True)
-    qualifications_master = get_qualifications()
-    current_documents = get_documents(limit=30)
+    # payload軽量化: 資格マスタはコード一覧のみ、documentsはプレビュー短縮
+    qualifications_master = [{"code": q["code"], "name": q["name"]} for q in get_qualifications()]
+    current_documents = get_documents(limit=20, preview_chars=200)
+    # documentsからtext_previewを除外（大量テキストでpayload肥大を防止）
+    docs_light = [
+        {k: v for k, v in d.items() if k != "text_preview"}
+        for d in current_documents
+    ]
+    # 添付のtext_contentも4000文字に制限
+    for info in uploaded_docs_info:
+        if info.get("text_content") and len(info["text_content"]) > 4000:
+            info["text_content"] = info["text_content"][:4000] + "\n...(以下省略)"
 
     async with message.channel.typing():
         try:
@@ -2754,10 +2764,10 @@ async def on_message(message):
                 "candidates": current_candidates,
                 "employees": current_employees,
                 "qualifications_master": qualifications_master,
-                "documents": current_documents,
+                "documents": docs_light,
                 "uploaded_docs": uploaded_docs_info
             }
-            r = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=30)
+            r = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=120)
             print(f"[n8n] status={r.status_code}")
 
             if r.status_code == 200:
