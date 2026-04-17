@@ -51,15 +51,91 @@ def get_drive_service():
         return None
 
 
-def upload_to_drive(file_bytes, filename, mime_type="application/octet-stream"):
-    """Driveにファイルをアップロード（共有ドライブ対応）。戻り値: {file_id, web_link, size} or None"""
+# Drive上のフォルダ構造（CLAUDE.mdと同じ）
+DRIVE_FOLDER_CATEGORIES = {
+    "事業計画": "01_事業計画",
+    "内装": "02_改装計画",
+    "改装": "02_改装計画",
+    "行政": "03_行政資料",
+    "消防": "03_行政資料",
+    "法令": "04_法令・報酬",
+    "報酬": "04_法令・報酬",
+    "市場分析": "05_競合・市場",
+    "競合": "05_競合・市場",
+    "採用": "06_人事・採用",
+    "人事": "06_人事・採用",
+    "物件": "07_物件",
+    "議事録": "03_行政資料",
+    "研修": "06_人事・採用",
+    "経理": "08_経理",
+    "資金": "08_経理",
+    "その他": "99_参考資料",
+}
+
+# DriveフォルダIDのキャッシュ（フォルダ名→ID）
+_drive_subfolder_cache = {}
+
+
+def get_or_create_drive_subfolder(subfolder_name):
+    """共有ドライブ内のサブフォルダを取得。なければ作成。"""
+    if subfolder_name in _drive_subfolder_cache:
+        return _drive_subfolder_cache[subfolder_name]
+    svc = get_drive_service()
+    if not svc or not GOOGLE_DRIVE_FOLDER_ID:
+        return GOOGLE_DRIVE_FOLDER_ID
+    try:
+        # 既存フォルダを検索
+        query = (
+            f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents "
+            f"and name = '{subfolder_name}' "
+            f"and mimeType = 'application/vnd.google-apps.folder' "
+            f"and trashed = false"
+        )
+        resp = svc.files().list(
+            q=query, fields="files(id, name)",
+            supportsAllDrives=True, includeItemsFromAllDrives=True, corpora="allDrives"
+        ).execute()
+        files = resp.get("files", [])
+        if files:
+            folder_id = files[0]["id"]
+            _drive_subfolder_cache[subfolder_name] = folder_id
+            return folder_id
+        # なければ作成
+        metadata = {
+            "name": subfolder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [GOOGLE_DRIVE_FOLDER_ID],
+        }
+        result = svc.files().create(
+            body=metadata, fields="id", supportsAllDrives=True
+        ).execute()
+        folder_id = result["id"]
+        _drive_subfolder_cache[subfolder_name] = folder_id
+        print(f"[Drive] フォルダ作成: {subfolder_name} ({folder_id})")
+        return folder_id
+    except Exception as e:
+        print(f"[Drive Folder Error] {e}")
+        return GOOGLE_DRIVE_FOLDER_ID
+
+
+def resolve_drive_folder(category=None):
+    """カテゴリからDrive上のサブフォルダIDを解決"""
+    if not category:
+        return GOOGLE_DRIVE_FOLDER_ID
+    subfolder_name = DRIVE_FOLDER_CATEGORIES.get(category, "99_参考資料")
+    return get_or_create_drive_subfolder(subfolder_name)
+
+
+def upload_to_drive(file_bytes, filename, mime_type="application/octet-stream", category=None):
+    """Driveにファイルをアップロード（カテゴリ別フォルダに振り分け）。"""
     svc = get_drive_service()
     if not svc or not GOOGLE_DRIVE_FOLDER_ID:
         return None
     try:
         from googleapiclient.http import MediaIoBaseUpload
+        parent_id = resolve_drive_folder(category)
         media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
-        metadata = {"name": filename, "parents": [GOOGLE_DRIVE_FOLDER_ID]}
+        metadata = {"name": filename, "parents": [parent_id]}
         result = svc.files().create(
             body=metadata, media_body=media,
             fields="id, webViewLink, size, mimeType, name",
@@ -97,30 +173,39 @@ def download_from_drive(file_id):
         return None
 
 
-def list_drive_folder_files():
-    """共有ドライブ/フォルダ内の全ファイルを取得（共有ドライブ対応、modifiedTime含む）"""
+def list_drive_folder_files(parent_id=None, recursive=True):
+    """共有ドライブ/フォルダ内の全ファイルを取得（サブフォルダ再帰対応）"""
     svc = get_drive_service()
     if not svc or not GOOGLE_DRIVE_FOLDER_ID:
         return []
+    if parent_id is None:
+        parent_id = GOOGLE_DRIVE_FOLDER_ID
     try:
-        query = f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
-        results = []
+        query = f"'{parent_id}' in parents and trashed = false"
+        all_items = []
         page_token = None
         while True:
             resp = svc.files().list(
                 q=query,
-                fields="nextPageToken, files(id, name, mimeType, size, webViewLink, modifiedTime)",
+                fields="nextPageToken, files(id, name, mimeType, size, webViewLink, modifiedTime, parents)",
                 pageSize=100,
                 pageToken=page_token,
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
                 corpora="allDrives"
             ).execute()
-            results.extend(resp.get("files", []))
+            all_items.extend(resp.get("files", []))
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
-        return results
+        files = []
+        for item in all_items:
+            if item.get("mimeType") == "application/vnd.google-apps.folder":
+                if recursive:
+                    files.extend(list_drive_folder_files(item["id"], recursive=True))
+            else:
+                files.append(item)
+        return files
     except Exception as e:
         print(f"[Drive List Error] {e}")
         return []
@@ -181,6 +266,29 @@ def rename_drive_file(file_id, new_name):
         return True
     except Exception as e:
         print(f"[Drive Rename Error] {e}")
+        return False
+
+
+def move_drive_file_to_folder(file_id, new_parent_id):
+    """Drive上のファイルを別フォルダに移動"""
+    svc = get_drive_service()
+    if not svc or not file_id:
+        return False
+    try:
+        # 現在の親フォルダを取得
+        f = svc.files().get(
+            fileId=file_id, fields="parents", supportsAllDrives=True
+        ).execute()
+        current_parents = ",".join(f.get("parents", []))
+        svc.files().update(
+            fileId=file_id,
+            addParents=new_parent_id,
+            removeParents=current_parents,
+            supportsAllDrives=True,
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"[Drive Move Error] {e}")
         return False
 
 
@@ -1589,6 +1697,36 @@ def execute_doc_ops(user_id, doc_ops):
                 did = op.get("doc_id")
                 fields = {k: v for k, v in op.items() if k not in ("action", "doc_id")}
                 if update_document(did, **fields):
+                    # DriveファイルID取得
+                    with get_db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT drive_file_id, file_name FROM documents WHERE id = %s", (did,))
+                            row = cur.fetchone()
+                    drive_fid = row[0] if row else None
+                    old_fname = row[1] if row else None
+
+                    # タイトル変更時はDrive上のファイル名もリネーム
+                    new_title = op.get("title")
+                    if new_title and drive_fid:
+                        import os as _os
+                        ext = _os.path.splitext(old_fname or "")[1] if old_fname else ""
+                        new_name = new_title if new_title.endswith(ext) else new_title + ext
+                        rename_drive_file(drive_fid, new_name)
+                        with get_db() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE documents SET file_name = %s WHERE id = %s",
+                                    (new_name, did)
+                                )
+                            conn.commit()
+
+                    # カテゴリ変更時はDriveの正しいフォルダに移動
+                    new_category = op.get("category")
+                    if new_category and drive_fid:
+                        target_folder = resolve_drive_folder(new_category)
+                        move_drive_file_to_folder(drive_fid, target_folder)
+                        print(f"[DocOps] Doc#{did} moved to folder: {new_category}")
+
                     results.append(f"[Doc#{did}] 更新完了")
             elif action == "delete":
                 did = op.get("doc_id")
