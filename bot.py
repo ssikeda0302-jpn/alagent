@@ -98,7 +98,7 @@ def download_from_drive(file_id):
 
 
 def list_drive_folder_files():
-    """共有ドライブ/フォルダ内の全ファイルを取得（共有ドライブ対応）"""
+    """共有ドライブ/フォルダ内の全ファイルを取得（共有ドライブ対応、modifiedTime含む）"""
     svc = get_drive_service()
     if not svc or not GOOGLE_DRIVE_FOLDER_ID:
         return []
@@ -109,7 +109,7 @@ def list_drive_folder_files():
         while True:
             resp = svc.files().list(
                 q=query,
-                fields="nextPageToken, files(id, name, mimeType, size, webViewLink)",
+                fields="nextPageToken, files(id, name, mimeType, size, webViewLink, modifiedTime)",
                 pageSize=100,
                 pageToken=page_token,
                 supportsAllDrives=True,
@@ -124,6 +124,35 @@ def list_drive_folder_files():
     except Exception as e:
         print(f"[Drive List Error] {e}")
         return []
+
+
+# Drive上のファイルのテキスト系判定
+TEXT_FILE_EXTENSIONS = (".txt", ".md", ".csv", ".json", ".log", ".yaml", ".yml",
+                         ".py", ".js", ".html", ".xml", ".tsv")
+
+
+def is_text_file_meta(drive_file):
+    """Driveのファイルメタデータからテキスト系か判定"""
+    name = (drive_file.get("name") or "").lower()
+    mime = drive_file.get("mimeType") or ""
+    if mime.startswith("text/") or mime in ("application/json", "application/xml"):
+        return True
+    return name.endswith(TEXT_FILE_EXTENSIONS)
+
+
+def fetch_drive_text_content(file_id, max_chars=20000):
+    """Drive上のテキストファイルの中身を取得（UTF-8/Shift_JIS自動判定）"""
+    data = download_from_drive(file_id)
+    if not data:
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = data.decode("shift_jis")
+        except UnicodeDecodeError:
+            return None
+    return text[:max_chars]
 
 
 def delete_from_drive(file_id):
@@ -1400,7 +1429,7 @@ def create_document(user_id, title, drive_file_id=None, drive_web_link=None,
 
 
 def update_document(doc_id, **kwargs):
-    allowed = {"title", "description", "category", "tags", "text_content"}
+    allowed = {"title", "description", "category", "tags", "text_content", "file_name"}
     updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
     if not updates:
         return False
@@ -1433,32 +1462,106 @@ def delete_document(doc_id, delete_from_drive_too=True):
 
 
 def scan_and_import_drive(user_id):
-    """Drive共有フォルダの既存ファイルをDBに取り込む"""
-    imported = 0
-    skipped = 0
-    for f in list_drive_folder_files():
-        file_id = f.get("id")
-        name = f.get("name", "unknown")
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM documents WHERE drive_file_id = %s", (file_id,))
-                if cur.fetchone():
-                    skipped += 1
-                    continue
-        try:
-            create_document(
-                user_id=user_id,
-                title=name,
-                drive_file_id=file_id,
-                drive_web_link=f.get("webViewLink"),
-                file_name=name,
-                mime_type=f.get("mimeType"),
-                file_size=int(f.get("size", 0)) if f.get("size") else 0
+    """互換用エイリアス：sync_drive_to_db を呼ぶ"""
+    return sync_drive_to_db(user_id)
+
+
+def sync_drive_to_db(user_id="auto_sync"):
+    """Drive→DB の一方向同期。Driveを正、DBをミラーとする。
+
+    - Driveに新規追加されたファイル → DBに追加（テキストなら中身も取得）
+    - Driveで更新されたファイル → DBの該当レコードを更新（ファイル名/サイズ比較）
+    - Driveから削除されたファイル → DBからも削除（drive_file_id を持つもののみ対象）
+    - Discord添付経由で登録された drive_file_id=NULL のレコードは触らない
+    """
+    drive_files = list_drive_folder_files()
+    drive_id_set = {f["id"] for f in drive_files}
+
+    # DB内のDrive由来ドキュメント一覧
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT id, drive_file_id, file_name, file_size
+                   FROM documents
+                   WHERE drive_file_id IS NOT NULL"""
             )
-            imported += 1
+            existing = cur.fetchall()
+    by_drive_id = {row["drive_file_id"]: row for row in existing}
+
+    added = 0
+    updated = 0
+    removed = 0
+    errors = 0
+
+    # 追加・更新処理
+    for f in drive_files:
+        fid = f.get("id")
+        name = f.get("name", "unknown")
+        size = int(f.get("size", 0)) if f.get("size") else 0
+        try:
+            if fid not in by_drive_id:
+                # 新規追加：テキストファイルなら中身も取得
+                text_content = None
+                if is_text_file_meta(f):
+                    text_content = fetch_drive_text_content(fid)
+                create_document(
+                    user_id=user_id,
+                    title=name,
+                    drive_file_id=fid,
+                    drive_web_link=f.get("webViewLink"),
+                    file_name=name,
+                    mime_type=f.get("mimeType"),
+                    file_size=size,
+                    text_content=text_content,
+                )
+                added += 1
+                print(f"[Sync] +ADD: {name}")
+            else:
+                # 既存：ファイル名/サイズ変更を検知
+                row = by_drive_id[fid]
+                needs_update = (row["file_name"] != name) or (row["file_size"] != size)
+                if needs_update:
+                    text_content = None
+                    if is_text_file_meta(f):
+                        text_content = fetch_drive_text_content(fid)
+                    update_document(
+                        row["id"],
+                        title=name,
+                        file_name=name,
+                        text_content=text_content,
+                    )
+                    with get_db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE documents SET file_size = %s WHERE id = %s",
+                                (size, row["id"]),
+                            )
+                        conn.commit()
+                    updated += 1
+                    print(f"[Sync] *UPD: {name}")
         except Exception as e:
-            print(f"[Scan Error] {name}: {e}")
-    return {"imported": imported, "skipped": skipped}
+            errors += 1
+            print(f"[Sync Error] {name}: {e}")
+
+    # 削除処理：Driveから消えたファイルをDBから削除
+    for fid, row in by_drive_id.items():
+        if fid not in drive_id_set:
+            try:
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM documents WHERE id = %s", (row["id"],))
+                    conn.commit()
+                removed += 1
+                print(f"[Sync] -REM: {row['file_name']}")
+            except Exception as e:
+                errors += 1
+                print(f"[Sync Error] remove {row['file_name']}: {e}")
+
+    print(f"[Sync] 完了: +{added} *{updated} -{removed} (errors={errors})")
+    return {"added": added, "updated": updated, "removed": removed,
+            "errors": errors, "total": len(drive_files),
+            # 旧API互換
+            "imported": added, "skipped": len(drive_files) - added - updated}
 
 
 # --- 資料ops実行 ---
@@ -2114,11 +2217,40 @@ async def docs_command(interaction: discord.Interaction, category: str = None):
     await interaction.response.send_message(embed=embed, view=view)
 
 
+@tree.command(name="sync", description="Google DriveとDBを同期（Drive→DB一方向）")
+async def sync_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    user_id = str(interaction.user.id)
+    result = sync_drive_to_db(user_id)
+    embed = discord.Embed(
+        title="🔄 Drive同期完了",
+        color=discord.Color.green(),
+        timestamp=datetime.now()
+    )
+    embed.add_field(name="追加", value=f"{result['added']}件", inline=True)
+    embed.add_field(name="更新", value=f"{result['updated']}件", inline=True)
+    embed.add_field(name="削除", value=f"{result['removed']}件", inline=True)
+    embed.add_field(name="エラー", value=f"{result['errors']}件", inline=True)
+    embed.add_field(name="Drive総ファイル数", value=f"{result['total']}件", inline=True)
+    await interaction.followup.send(embed=embed)
+
+
 @tree.command(name="dashboard", description="全体ダッシュボードを表示")
 async def dashboard_command(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     embed = build_overview_embed(user_id)
     await interaction.response.send_message(embed=embed)
+
+
+@tasks.loop(minutes=15)
+async def drive_sync_loop():
+    """15分ごとにDrive→DBの自動同期"""
+    try:
+        result = sync_drive_to_db("auto_sync")
+        if result["added"] or result["updated"] or result["removed"]:
+            print(f"[Auto Sync] +{result['added']} *{result['updated']} -{result['removed']}")
+    except Exception as e:
+        print(f"[Auto Sync Error] {e}")
 
 
 @client.event
@@ -2131,6 +2263,8 @@ async def on_ready():
         print(f"[Slash Sync Error] {e}")
     if GOOGLE_SERVICE_ACCOUNT_JSON:
         get_drive_service()  # 初期化を試みる
+        drive_sync_loop.start()
+        print("[Drive Sync] 15分おき自動同期ループ開始")
     if REMINDER_CHANNEL_ID:
         reminder_loop.start()
         print(f"[Reminder] 自動通知ループ開始 (channel={REMINDER_CHANNEL_ID})")
