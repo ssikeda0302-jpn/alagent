@@ -2768,10 +2768,19 @@ async def on_message(message):
                 "uploaded_docs": uploaded_docs_info
             }
             r = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=120)
-            print(f"[n8n] status={r.status_code}")
+            print(f"[n8n] status={r.status_code} body_len={len(r.text)}")
 
             if r.status_code == 200:
-                data = r.json()
+                if not r.text.strip():
+                    print("[n8n] Empty response body")
+                    await message.reply("n8nから空のレスポンスが返ってきました。ワークフローが停止/エラーの可能性があります。n8nのExecutionsを確認してください。")
+                    return
+                try:
+                    data = r.json()
+                except ValueError as je:
+                    print(f"[n8n] JSON parse error: {je}, body={r.text[:300]}")
+                    await message.reply(f"n8nの応答を解析できませんでした: {r.text[:200]}")
+                    return
                 raw_reply = data.get("text", "") or data.get("message", "") or str(data)
                 reply, task_ops, schedule_ops, hr_ops, revenue_ops, doc_ops = parse_ai_response(raw_reply)
 
