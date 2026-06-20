@@ -1968,6 +1968,44 @@ def parse_ai_response(text):
                 return extract(data)
         except (json.JSONDecodeError, TypeError):
             pass
+        # フォールバック: モデルが {reply, task_ops} オブジェクトを出さず、
+    # 文章＋```json [ {action...}, ... ]``` の形で操作を返すケースを救済する。
+    collected = []
+    for raw in re.findall(r'```(?:json)?\s*([\s\S]*?)```', text):
+        try:
+            parsed = json.loads(raw.strip())
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if isinstance(parsed, list):
+            collected.extend(op for op in parsed if isinstance(op, dict) and "action" in op)
+    # フェンスが無い裸の配列も一応試す
+    if not collected:
+        bare = re.search(r'\[\s*\{[\s\S]*?"action"[\s\S]*?\}\s*\]', text)
+        if bare:
+            try:
+                parsed = json.loads(bare.group())
+                if isinstance(parsed, list):
+                    collected.extend(op for op in parsed if isinstance(op, dict) and "action" in op)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    if collected:
+        task_ops, schedule_ops, hr_ops, revenue_ops, doc_ops = [], [], [], [], []
+        for op in collected:
+            if "schedule_id" in op or "start_date" in op:
+                schedule_ops.append(op)
+            elif "doc_id" in op:
+                doc_ops.append(op)
+            elif any(k in op for k in ("candidate_id", "employee_id", "qualification")):
+                hr_ops.append(op)
+            elif "service_type" in op or op.get("action") in ("calculate", "simulate_hire"):
+                revenue_ops.append(op)
+            else:
+                task_ops.append(op)
+        # コードブロックを除いた本文だけをユーザーに見せる
+        reply = re.sub(r'```(?:json)?\s*[\s\S]*?```', '', text).strip()
+        return reply, task_ops, schedule_ops, hr_ops, revenue_ops, doc_ops
     return text, [], [], [], [], []
 
 
