@@ -2692,7 +2692,8 @@ async def on_message(message):
                         url_filename = None
 
                     candidates = []
-                    for cand in (url_filename, raw_filename):
+                    # 元の名前（att.filename）を最優先。URL末尾はハッシュ化されることがあるため後順。
+                    for cand in (raw_filename, url_filename):
                         if not cand:
                             continue
                         try:
