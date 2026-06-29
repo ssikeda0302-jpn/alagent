@@ -304,6 +304,9 @@ def is_mangled_filename(filename):
     # ASCIIのみ＋短い（5文字以下）、もしくは先頭がアンダースコア
     if len(base) <= 5 or base.startswith("_"):
         return True
+    # ランダムな16進ハッシュ名（Discordが日本語名をハッシュ化した場合）も崩れ扱い
+    if re.fullmatch(r'[0-9a-fA-F]{8,}', base):
+        return True
     return False
 
 
@@ -2706,11 +2709,15 @@ async def on_message(message):
                     if not filename:
                         filename = candidates[0] if candidates else raw_filename
 
-                    # それでも崩れているならメッセージ本文から推測
-                    if is_mangled_filename(filename) and message.content.strip():
-                        inferred = infer_filename_from_message(message.content, filename)
-                        print(f"[Attachment] mangled -> inferred: {filename!r} -> {inferred!r}")
-                        filename = inferred
+                    # それでも崩れている場合：メッセージ本文は指示文（「保存して」等）の
+                    # 可能性が高いのでファイル名に流用しない。中立な名前にしておき、
+                    # 後段のdoc_ops（LLMが中身から推測したタイトル）で正式名にリネームさせる。
+                    if is_mangled_filename(filename):
+                        import os as _os
+                        from datetime import datetime as _dtnow
+                        ext = _os.path.splitext(filename)[1] or ""
+                        filename = f"添付資料_{_dtnow.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+                        print(f"[Attachment] mangled -> neutral: {filename!r}")
 
                     print(f"[Attachment] raw={raw_filename!r} url_name={url_filename!r} final={filename!r}")
                     doc_info = {"filename": filename, "mime_type": mime}
